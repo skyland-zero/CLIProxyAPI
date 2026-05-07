@@ -470,14 +470,6 @@ func (s *PostgresStore) summaryGroupExpression(groupBy string, timeZoneArgPos in
 	}
 }
 
-func normalizeSummaryTimeZone(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "UTC"
-	}
-	return value
-}
-
 func quoteIdentifier(identifier string) string {
 	replaced := strings.ReplaceAll(identifier, "\"", "\"\"")
 	return "\"" + replaced + "\""

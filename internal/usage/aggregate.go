@@ -189,18 +189,6 @@ func GroupValueForPricing(event Event, groupBy string, timeZone string) string {
 	return groupValue(event, normalizeGroupBy(groupBy), summaryLocation(timeZone))
 }
 
-func summaryLocation(timeZone string) *time.Location {
-	timeZone = strings.TrimSpace(timeZone)
-	if timeZone == "" {
-		return time.UTC
-	}
-	location, err := time.LoadLocation(timeZone)
-	if err != nil {
-		return time.UTC
-	}
-	return location
-}
-
 func eventMatches(event Event, query Query) bool {
 	if !query.From.IsZero() && event.Timestamp.Before(query.From) {
 		return false

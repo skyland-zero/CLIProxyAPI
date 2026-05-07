@@ -115,10 +115,12 @@ func (h *Handler) GetUsageSummary(c *gin.Context) {
 	}
 	tz := strings.TrimSpace(c.Query("tz"))
 	if tz != "" {
-		if _, err := time.LoadLocation(tz); err != nil {
+		normalized, _, err := usage.ResolveSummaryTimeZone(tz)
+		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tz"})
 			return
 		}
+		tz = normalized
 	}
 	summaryQuery := usage.SummaryQuery{
 		Query:    query,

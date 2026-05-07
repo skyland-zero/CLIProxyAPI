@@ -73,3 +73,16 @@ func TestMemoryStoreSummaryGroupsByAPIKeyHash(t *testing.T) {
 		t.Fatalf("first row = %+v, want aggregate for api key a", rows[0])
 	}
 }
+
+func TestResolveSummaryTimeZoneSupportsAsiaShanghai(t *testing.T) {
+	name, location, err := ResolveSummaryTimeZone("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("ResolveSummaryTimeZone error: %v", err)
+	}
+	if name != "Asia/Shanghai" {
+		t.Fatalf("name = %q, want Asia/Shanghai", name)
+	}
+	if location == nil {
+		t.Fatal("location = nil, want non-nil")
+	}
+}
