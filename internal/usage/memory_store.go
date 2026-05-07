@@ -57,7 +57,7 @@ func (s *MemoryStore) Events(_ context.Context, query Query) ([]Event, int64, er
 
 func (s *MemoryStore) Summary(_ context.Context, query SummaryQuery) ([]SummaryRow, error) {
 	events := s.filteredEvents(query.Query, false)
-	return buildSummary(events, query.GroupBy), nil
+	return buildSummary(events, query.GroupBy, query.TimeZone), nil
 }
 
 func (s *MemoryStore) Delete(_ context.Context, query Query) (int64, error) {

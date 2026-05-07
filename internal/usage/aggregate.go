@@ -104,11 +104,12 @@ func detailFromEvent(event Event) RequestDetail {
 	}
 }
 
-func buildSummary(events []Event, groupBy string) []SummaryRow {
+func buildSummary(events []Event, groupBy string, timeZone string) []SummaryRow {
 	groupBy = normalizeGroupBy(groupBy)
+	location := summaryLocation(timeZone)
 	rows := make(map[string]*SummaryRow)
 	for _, event := range events {
-		group := groupValue(event, groupBy)
+		group := groupValue(event, groupBy, location)
 		row := rows[group]
 		if row == nil {
 			row = &SummaryRow{Group: group}
@@ -141,8 +142,8 @@ func buildSummary(events []Event, groupBy string) []SummaryRow {
 }
 
 // BuildSummaryForPricing exposes usage grouping for cost estimation without duplicating grouping rules.
-func BuildSummaryForPricing(events []Event, groupBy string) []SummaryRow {
-	return buildSummary(events, groupBy)
+func BuildSummaryForPricing(events []Event, groupBy string, timeZone string) []SummaryRow {
+	return buildSummary(events, groupBy, timeZone)
 }
 
 func normalizeGroupBy(groupBy string) string {
@@ -154,7 +155,7 @@ func normalizeGroupBy(groupBy string) string {
 	}
 }
 
-func groupValue(event Event, groupBy string) string {
+func groupValue(event Event, groupBy string, location *time.Location) string {
 	var value string
 	switch groupBy {
 	case "model":
@@ -168,9 +169,9 @@ func groupValue(event Event, groupBy string) string {
 	case "source":
 		value = event.Source
 	case "day":
-		value = event.Timestamp.Format("2006-01-02")
+		value = event.Timestamp.In(location).Format("2006-01-02")
 	case "hour":
-		value = event.Timestamp.Format("2006-01-02 15:00")
+		value = event.Timestamp.In(location).Format("2006-01-02 15:00")
 	case "api_key_hash":
 		value = event.APIKeyHash
 	default:
@@ -184,8 +185,20 @@ func groupValue(event Event, groupBy string) string {
 }
 
 // GroupValueForPricing exposes the normalized group key used by Summary.
-func GroupValueForPricing(event Event, groupBy string) string {
-	return groupValue(event, normalizeGroupBy(groupBy))
+func GroupValueForPricing(event Event, groupBy string, timeZone string) string {
+	return groupValue(event, normalizeGroupBy(groupBy), summaryLocation(timeZone))
+}
+
+func summaryLocation(timeZone string) *time.Location {
+	timeZone = strings.TrimSpace(timeZone)
+	if timeZone == "" {
+		return time.UTC
+	}
+	location, err := time.LoadLocation(timeZone)
+	if err != nil {
+		return time.UTC
+	}
+	return location
 }
 
 func eventMatches(event Event, query Query) bool {

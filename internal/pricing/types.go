@@ -44,11 +44,3 @@ type PricedEvent struct {
 	usage.Event
 	EstimatedCostUSD *float64 `json:"estimated_cost_usd"`
 }
-
-// PricedSummaryRow is a usage summary row with cost rollups.
-type PricedSummaryRow struct {
-	usage.SummaryRow
-	EstimatedCostUSD *float64 `json:"estimated_cost_usd"`
-	PricedRequests   int64    `json:"priced_requests"`
-	UnpricedRequests int64    `json:"unpriced_requests"`
-}

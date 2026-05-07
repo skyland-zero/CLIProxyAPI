@@ -113,15 +113,35 @@ func (h *Handler) GetUsageSummary(c *gin.Context) {
 	if groupBy == "" {
 		groupBy = "provider"
 	}
-	summaryQuery := query
-	summaryQuery.Limit = 1000
-	summaryQuery.Offset = 0
-	events, _, err := usage.Events(c.Request.Context(), summaryQuery)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to query usage events: %v", err)})
-		return
+	tz := strings.TrimSpace(c.Query("tz"))
+	if tz != "" {
+		if _, err := time.LoadLocation(tz); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tz"})
+			return
+		}
 	}
-	rows, err := pricing.BuildPricedSummary(c.Request.Context(), events, groupBy)
+	summaryQuery := usage.SummaryQuery{
+		Query:    query,
+		GroupBy:  groupBy,
+		TimeZone: tz,
+	}
+	var (
+		rows []usage.SummaryRow
+		err  error
+	)
+	if usage.Mode() == "memory" {
+		eventQuery := query
+		eventQuery.Limit = 1000
+		eventQuery.Offset = 0
+		events, _, errEvents := usage.Events(c.Request.Context(), eventQuery)
+		if errEvents != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to query usage events: %v", errEvents)})
+			return
+		}
+		rows, err = pricing.BuildPricedSummary(c.Request.Context(), events, summaryQuery)
+	} else {
+		rows, err = usage.Summary(c.Request.Context(), summaryQuery)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to query usage summary: %v", err)})
 		return
@@ -130,6 +150,7 @@ func (h *Handler) GetUsageSummary(c *gin.Context) {
 		"mode":           usage.Mode(),
 		"retention_days": usage.RetentionDays,
 		"group_by":       groupBy,
+		"tz":             tz,
 		"summary":        rows,
 	})
 }

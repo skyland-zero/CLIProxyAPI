@@ -32,17 +32,16 @@ func PriceEvents(ctx context.Context, events []usage.Event) ([]PricedEvent, erro
 	return out, nil
 }
 
-func BuildPricedSummary(ctx context.Context, events []usage.Event, groupBy string) ([]PricedSummaryRow, error) {
-	baseRows := usage.BuildSummaryForPricing(events, groupBy)
-	rows := make([]PricedSummaryRow, 0, len(baseRows))
-	byGroup := make(map[string]*PricedSummaryRow, len(baseRows))
+func BuildPricedSummary(ctx context.Context, events []usage.Event, query usage.SummaryQuery) ([]usage.SummaryRow, error) {
+	baseRows := usage.BuildSummaryForPricing(events, query.GroupBy, query.TimeZone)
+	rows := make([]usage.SummaryRow, 0, len(baseRows))
+	byGroup := make(map[string]*usage.SummaryRow, len(baseRows))
 	for _, row := range baseRows {
-		priced := PricedSummaryRow{SummaryRow: row}
-		rows = append(rows, priced)
+		rows = append(rows, row)
 		byGroup[row.Group] = &rows[len(rows)-1]
 	}
 	for _, event := range events {
-		group := usage.GroupValueForPricing(event, groupBy)
+		group := usage.GroupValueForPricing(event, query.GroupBy, query.TimeZone)
 		row := byGroup[group]
 		if row == nil {
 			continue

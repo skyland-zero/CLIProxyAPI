@@ -103,20 +103,24 @@ type Query struct {
 // SummaryQuery filters and groups usage events.
 type SummaryQuery struct {
 	Query
-	GroupBy string
+	GroupBy  string
+	TimeZone string
 }
 
 // SummaryRow is one aggregate row returned by Summary.
 type SummaryRow struct {
-	Group           string `json:"group"`
-	TotalRequests   int64  `json:"total_requests"`
-	SuccessCount    int64  `json:"success_count"`
-	FailureCount    int64  `json:"failure_count"`
-	InputTokens     int64  `json:"input_tokens"`
-	OutputTokens    int64  `json:"output_tokens"`
-	ReasoningTokens int64  `json:"reasoning_tokens"`
-	CachedTokens    int64  `json:"cached_tokens"`
-	TotalTokens     int64  `json:"total_tokens"`
+	Group            string   `json:"group"`
+	TotalRequests    int64    `json:"total_requests"`
+	SuccessCount     int64    `json:"success_count"`
+	FailureCount     int64    `json:"failure_count"`
+	InputTokens      int64    `json:"input_tokens"`
+	OutputTokens     int64    `json:"output_tokens"`
+	ReasoningTokens  int64    `json:"reasoning_tokens"`
+	CachedTokens     int64    `json:"cached_tokens"`
+	TotalTokens      int64    `json:"total_tokens"`
+	EstimatedCostUSD *float64 `json:"estimated_cost_usd,omitempty"`
+	PricedRequests   int64    `json:"priced_requests"`
+	UnpricedRequests int64    `json:"unpriced_requests"`
 }
 
 // Store records and queries usage events.

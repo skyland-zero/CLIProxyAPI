@@ -161,6 +161,95 @@ func TestGetUsageSummary(t *testing.T) {
 	})
 }
 
+func TestGetUsageSummaryDayRespectsTimeZoneAndCost(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withMemoryPricingStore(t, func(priceStore *pricing.MemoryStore) {
+		if err := priceStore.UpsertPrices(nil, []pricing.ModelPrice{{
+			Provider:    pricing.ProviderOpenAI,
+			Model:       "gpt",
+			Category:    "standard",
+			Context:     "short_context",
+			Modality:    "text",
+			Unit:        "1m_tokens",
+			InputPer1M:  1,
+			OutputPer1M: 2,
+		}}); err != nil {
+			t.Fatalf("upsert price: %v", err)
+		}
+		withMemoryUsageStore(t, func(store *internalusage.MemoryStore) {
+			first := time.Date(2026, 5, 6, 23, 30, 0, 0, time.UTC)
+			second := time.Date(2026, 5, 7, 0, 30, 0, 0, time.UTC)
+			_ = store.Record(nil, internalusage.Event{
+				ID:        "1",
+				Timestamp: first,
+				Provider:  "openai",
+				Model:     "gpt",
+				Tokens: internalusage.TokenStats{
+					InputTokens:  1_000_000,
+					OutputTokens: 1_000_000,
+					TotalTokens:  2_000_000,
+				},
+			})
+			_ = store.Record(nil, internalusage.Event{
+				ID:        "2",
+				Timestamp: second,
+				Provider:  "openai",
+				Model:     "gpt",
+				Tokens: internalusage.TokenStats{
+					InputTokens:  1_000_000,
+					OutputTokens: 1_000_000,
+					TotalTokens:  2_000_000,
+				},
+			})
+
+			rec := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(rec)
+			ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/summary?group_by=day&tz=Asia/Shanghai", nil)
+
+			h := &Handler{}
+			h.GetUsageSummary(ginCtx)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var payload struct {
+				TimeZone string                     `json:"tz"`
+				Summary  []internalusage.SummaryRow `json:"summary"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("unmarshal response: %v", err)
+			}
+			if payload.TimeZone != "Asia/Shanghai" {
+				t.Fatalf("tz = %q, want Asia/Shanghai", payload.TimeZone)
+			}
+			if len(payload.Summary) != 1 {
+				t.Fatalf("summary rows = %d, want 1", len(payload.Summary))
+			}
+			row := payload.Summary[0]
+			if row.Group != "2026-05-07" || row.TotalRequests != 2 || row.PricedRequests != 2 || row.UnpricedRequests != 0 {
+				t.Fatalf("row = %+v, want one priced local-day bucket", row)
+			}
+			if row.EstimatedCostUSD == nil || *row.EstimatedCostUSD != 6 {
+				t.Fatalf("estimated cost = %v, want 6", row.EstimatedCostUSD)
+			}
+		})
+	})
+}
+
+func TestGetUsageSummaryInvalidTimeZone(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/summary?group_by=day&tz=Nope/Invalid", nil)
+
+	h := &Handler{}
+	h.GetUsageSummary(ginCtx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 func withManagementUsageQueue(t *testing.T, fn func()) {
 	t.Helper()
 

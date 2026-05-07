@@ -14,6 +14,7 @@ import (
 )
 
 const defaultUsageTable = "usage_events"
+const defaultPricingTable = "model_prices"
 
 type PostgresStoreConfig struct {
 	DSN    string
@@ -133,11 +134,115 @@ func (s *PostgresStore) Events(ctx context.Context, query Query) ([]Event, int64
 }
 
 func (s *PostgresStore) Summary(ctx context.Context, query SummaryQuery) ([]SummaryRow, error) {
-	events, err := s.queryEvents(ctx, query.Query, false)
-	if err != nil {
-		return nil, err
+	if s == nil || s.db == nil {
+		return nil, nil
 	}
-	return buildSummary(events, query.GroupBy), nil
+	query.Query = clampQueryToRetention(query.Query, nowUTC())
+	groupBy := normalizeGroupBy(query.GroupBy)
+	timeZone := normalizeSummaryTimeZone(query.TimeZone)
+	where, args := s.whereClause(query.Query)
+	groupExpr, usesTimeZone := s.summaryGroupExpression(groupBy, len(args)+1)
+	if usesTimeZone {
+		args = append(args, timeZone)
+	}
+	sqlQuery := fmt.Sprintf(`
+		SELECT
+			%s AS group_value,
+			COUNT(*)::BIGINT AS total_requests,
+			SUM(CASE WHEN e.failed THEN 0 ELSE 1 END)::BIGINT AS success_count,
+			SUM(CASE WHEN e.failed THEN 1 ELSE 0 END)::BIGINT AS failure_count,
+			COALESCE(SUM(e.input_tokens), 0)::BIGINT AS input_tokens,
+			COALESCE(SUM(e.output_tokens), 0)::BIGINT AS output_tokens,
+			COALESCE(SUM(e.reasoning_tokens), 0)::BIGINT AS reasoning_tokens,
+			COALESCE(SUM(e.cached_tokens), 0)::BIGINT AS cached_tokens,
+			COALESCE(SUM(e.total_tokens), 0)::BIGINT AS total_tokens,
+			COALESCE(SUM(
+				CASE
+					WHEN price.input_per_1m IS NULL THEN 0
+					ELSE
+						(e.input_tokens::NUMERIC / 1000000.0) * price.input_per_1m +
+						(e.cached_tokens::NUMERIC / 1000000.0) * price.cached_input_per_1m +
+						((e.output_tokens + e.reasoning_tokens)::NUMERIC / 1000000.0) * price.output_per_1m
+				END
+			), 0)::DOUBLE PRECISION AS estimated_cost_usd,
+			SUM(CASE WHEN price.input_per_1m IS NULL THEN 0 ELSE 1 END)::BIGINT AS priced_requests,
+			SUM(CASE WHEN price.input_per_1m IS NULL THEN 1 ELSE 0 END)::BIGINT AS unpriced_requests
+		FROM %s e
+		LEFT JOIN LATERAL (
+			SELECT
+				mp.input_per_1m,
+				mp.cached_input_per_1m,
+				mp.output_per_1m
+			FROM %s mp
+			WHERE lower(mp.provider) IN (
+				CASE
+					WHEN lower(e.provider) IN ('openai', 'codex', 'openai-compat', 'openai-compatible', 'openai_compat', 'openai-compatibility') THEN 'openai'
+					ELSE lower(e.provider)
+				END,
+				'openai'
+			)
+				AND mp.unit = '1m_tokens'
+				AND mp.modality = 'text'
+				AND (
+					(e.model <> '' AND mp.model = e.model) OR
+					(e.alias <> '' AND mp.model = e.alias)
+				)
+			ORDER BY
+				CASE
+					WHEN e.model <> '' AND mp.model = e.model THEN 0
+					WHEN e.alias <> '' AND mp.model = e.alias THEN 1
+					ELSE 2
+				END,
+				CASE mp.context
+					WHEN 'short_context' THEN 0
+					WHEN 'standard' THEN 1
+					ELSE 2
+				END
+			LIMIT 1
+		) price ON TRUE
+		%s
+		GROUP BY 1
+		ORDER BY total_requests DESC, group_value ASC
+	`, groupExpr, s.fullTableName(), s.fullPricingTableName(), where)
+
+	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("usage postgres store: summary query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]SummaryRow, 0, 32)
+	for rows.Next() {
+		var row SummaryRow
+		var estimatedCost float64
+		if err = rows.Scan(
+			&row.Group,
+			&row.TotalRequests,
+			&row.SuccessCount,
+			&row.FailureCount,
+			&row.InputTokens,
+			&row.OutputTokens,
+			&row.ReasoningTokens,
+			&row.CachedTokens,
+			&row.TotalTokens,
+			&estimatedCost,
+			&row.PricedRequests,
+			&row.UnpricedRequests,
+		); err != nil {
+			return nil, fmt.Errorf("usage postgres store: scan summary row: %w", err)
+		}
+		if row.Group == "" {
+			row.Group = "unknown"
+		}
+		if row.PricedRequests > 0 {
+			row.EstimatedCostUSD = &estimatedCost
+		}
+		out = append(out, row)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("usage postgres store: iterate summary rows: %w", err)
+	}
+	return out, nil
 }
 
 func (s *PostgresStore) Delete(ctx context.Context, query Query) (int64, error) {
@@ -343,6 +448,34 @@ func (s *PostgresStore) fullTableName() string {
 		return quoteIdentifier(s.tableName)
 	}
 	return quoteIdentifier(s.schema) + "." + quoteIdentifier(s.tableName)
+}
+
+func (s *PostgresStore) fullPricingTableName() string {
+	if strings.TrimSpace(s.schema) == "" {
+		return quoteIdentifier(defaultPricingTable)
+	}
+	return quoteIdentifier(s.schema) + "." + quoteIdentifier(defaultPricingTable)
+}
+
+func (s *PostgresStore) summaryGroupExpression(groupBy string, timeZoneArgPos int) (string, bool) {
+	switch groupBy {
+	case "model", "alias", "auth_id", "auth_type", "source", "api_key_hash", "provider":
+		return fmt.Sprintf("COALESCE(NULLIF(TRIM(e.%s), ''), 'unknown')", groupBy), false
+	case "day":
+		return fmt.Sprintf("TO_CHAR(DATE_TRUNC('day', timezone($%d, e.timestamp)), 'YYYY-MM-DD')", timeZoneArgPos), true
+	case "hour":
+		return fmt.Sprintf("TO_CHAR(DATE_TRUNC('hour', timezone($%d, e.timestamp)), 'YYYY-MM-DD HH24:00')", timeZoneArgPos), true
+	default:
+		return "COALESCE(NULLIF(TRIM(e.provider), ''), 'unknown')", false
+	}
+}
+
+func normalizeSummaryTimeZone(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "UTC"
+	}
+	return value
 }
 
 func quoteIdentifier(identifier string) string {
