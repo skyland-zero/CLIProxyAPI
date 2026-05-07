@@ -24,11 +24,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/pricing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/store"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/tui"
+	usage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -417,6 +419,24 @@ func main() {
 			configFileExists = true
 		}
 	}
+	if usePostgresStore {
+		ctxUsage, cancelUsage := context.WithTimeout(context.Background(), 30*time.Second)
+		if errUsage := usage.InitializePostgres(ctxUsage, pgStoreDSN, pgStoreSchema); errUsage != nil {
+			cancelUsage()
+			log.Errorf("failed to initialize postgres usage store: %v", errUsage)
+			return
+		}
+		if errPricing := pricing.InitializePostgres(ctxUsage, pgStoreDSN, pgStoreSchema); errPricing != nil {
+			cancelUsage()
+			log.Errorf("failed to initialize postgres pricing store: %v", errPricing)
+			return
+		}
+		cancelUsage()
+	} else {
+		usage.InitializeMemory()
+		pricing.InitializeMemory()
+	}
+	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
@@ -572,6 +592,7 @@ func main() {
 			// Start the main proxy service
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
 			misc.StartAntigravityVersionUpdater(context.Background())
+			pricing.StartOpenAIRefreshLoop(context.Background())
 			if !localModel {
 				registry.StartModelsUpdater(context.Background())
 			}

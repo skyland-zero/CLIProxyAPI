@@ -5,9 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/pricing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
 func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
@@ -68,6 +71,96 @@ func TestGetUsageQueueInvalidCountDoesNotPop(t *testing.T) {
 	})
 }
 
+func TestGetUsageEventsFiltersByAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withMemoryPricingStore(t, func(priceStore *pricing.MemoryStore) {
+		if err := priceStore.UpsertPrices(nil, []pricing.ModelPrice{{
+			Provider:    pricing.ProviderOpenAI,
+			Model:       "gpt",
+			Category:    "standard",
+			Context:     "short_context",
+			Modality:    "text",
+			Unit:        "1m_tokens",
+			InputPer1M:  1,
+			OutputPer1M: 2,
+		}}); err != nil {
+			t.Fatalf("upsert price: %v", err)
+		}
+		withMemoryUsageStore(t, func(store *internalusage.MemoryStore) {
+			if err := store.Record(nil, internalusage.Event{
+				ID:         "event-1",
+				Timestamp:  time.Now().UTC(),
+				Provider:   "openai",
+				Model:      "gpt",
+				APIKeyHash: internalusage.HashAPIKey("client-key"),
+				Tokens:     internalusage.TokenStats{InputTokens: 1_000_000, OutputTokens: 1_000_000},
+			}); err != nil {
+				t.Fatalf("record usage: %v", err)
+			}
+
+			rec := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(rec)
+			ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/events?api_key=client-key&limit=10", nil)
+
+			h := &Handler{}
+			h.GetUsageEvents(ginCtx)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var payload struct {
+				Mode   string `json:"mode"`
+				Total  int64  `json:"total"`
+				Events []struct {
+					internalusage.Event
+					EstimatedCostUSD *float64 `json:"estimated_cost_usd"`
+				} `json:"events"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("unmarshal response: %v", err)
+			}
+			if payload.Mode != "memory" || payload.Total != 1 || len(payload.Events) != 1 {
+				t.Fatalf("payload = %+v, want one memory event", payload)
+			}
+			if payload.Events[0].APIKeyHash == "client-key" || payload.Events[0].APIKeyHash == "" {
+				t.Fatalf("api key hash = %q, want hashed value only", payload.Events[0].APIKeyHash)
+			}
+			if payload.Events[0].EstimatedCostUSD == nil || *payload.Events[0].EstimatedCostUSD != 3 {
+				t.Fatalf("estimated cost = %v, want 3", payload.Events[0].EstimatedCostUSD)
+			}
+		})
+	})
+}
+
+func TestGetUsageSummary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withMemoryUsageStore(t, func(store *internalusage.MemoryStore) {
+		now := time.Now().UTC()
+		_ = store.Record(nil, internalusage.Event{ID: "1", Timestamp: now, Provider: "openai", Model: "gpt", Tokens: internalusage.TokenStats{TotalTokens: 5}})
+		_ = store.Record(nil, internalusage.Event{ID: "2", Timestamp: now, Provider: "openai", Model: "gpt", Failed: true, Tokens: internalusage.TokenStats{TotalTokens: 7}})
+
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+		ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/summary?group_by=provider", nil)
+
+		h := &Handler{}
+		h.GetUsageSummary(ginCtx)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var payload struct {
+			Summary []internalusage.SummaryRow `json:"summary"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(payload.Summary) != 1 || payload.Summary[0].Group != "openai" || payload.Summary[0].TotalRequests != 2 || payload.Summary[0].FailureCount != 1 {
+			t.Fatalf("summary = %+v, want openai aggregate", payload.Summary)
+		}
+	})
+}
+
 func withManagementUsageQueue(t *testing.T, fn func()) {
 	t.Helper()
 
@@ -81,6 +174,24 @@ func withManagementUsageQueue(t *testing.T, fn func()) {
 	}()
 
 	fn()
+}
+
+func withMemoryUsageStore(t *testing.T, fn func(*internalusage.MemoryStore)) {
+	t.Helper()
+	previous := internalusage.DefaultStore()
+	store := internalusage.NewMemoryStore()
+	internalusage.SetDefaultStore(store)
+	t.Cleanup(func() { internalusage.SetDefaultStore(previous) })
+	fn(store)
+}
+
+func withMemoryPricingStore(t *testing.T, fn func(*pricing.MemoryStore)) {
+	t.Helper()
+	previous := pricing.DefaultStore()
+	store := pricing.NewMemoryStore()
+	pricing.SetDefaultStore(store)
+	t.Cleanup(func() { pricing.SetDefaultStore(previous) })
+	fn(store)
 }
 
 func requireRecordID(t *testing.T, raw json.RawMessage, want int) {
