@@ -79,7 +79,7 @@ func RegisterAppLogHook() {
 }
 
 func (h *AppLogHook) Levels() []log.Level {
-	return []log.Level{log.WarnLevel, log.ErrorLevel, log.FatalLevel, log.PanicLevel}
+	return []log.Level{log.InfoLevel, log.WarnLevel, log.ErrorLevel, log.FatalLevel, log.PanicLevel}
 }
 
 func (h *AppLogHook) Fire(entry *log.Entry) error {

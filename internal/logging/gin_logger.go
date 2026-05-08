@@ -95,7 +95,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		case statusCode >= http.StatusBadRequest:
 			accessLogEntry(requestID, statusCode, method, path, latency, clientIP).Warn(logLine)
 		default:
-			log.WithField("request_id", requestID).Info(logLine)
+			accessLogEntry(requestID, statusCode, method, path, latency, clientIP).Info(logLine)
 		}
 	}
 }
