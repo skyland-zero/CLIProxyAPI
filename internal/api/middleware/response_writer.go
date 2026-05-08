@@ -17,15 +17,19 @@ import (
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
+const maxCapturedResponseBodyBytes = 4 << 20   // 4 MiB
+const maxStreamingQueuedChunkBytes = 256 << 10 // 256 KiB
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
-	URL       string              // URL is the request URL.
-	Method    string              // Method is the HTTP method (e.g., GET, POST).
-	Headers   map[string][]string // Headers contains the request headers.
-	Body      []byte              // Body is the raw request body.
-	RequestID string              // RequestID is the unique identifier for the request.
-	Timestamp time.Time           // Timestamp is when the request was received.
+	URL           string              // URL is the request URL.
+	Method        string              // Method is the HTTP method (e.g., GET, POST).
+	Headers       map[string][]string // Headers contains the request headers.
+	Body          []byte              // Body is the raw request body.
+	BodyBytes     int64               // BodyBytes is the original request body size when known.
+	BodyTruncated bool                // BodyTruncated indicates the request body was not fully captured.
+	RequestID     string              // RequestID is the unique identifier for the request.
+	Timestamp     time.Time           // Timestamp is when the request was received.
 }
 
 // ResponseWriterWrapper wraps the standard gin.ResponseWriter to intercept and log response data.
@@ -43,6 +47,9 @@ type ResponseWriterWrapper struct {
 	headers             map[string][]string        // headers stores the response headers.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
 	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	bodyTruncated       bool                       // bodyTruncated indicates the captured response body reached the memory cap.
+	streamTruncated     bool                       // streamTruncated indicates streaming log chunks were truncated or dropped.
+	responseBytesSeen   int64                      // responseBytesSeen tracks bytes written to the client.
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
@@ -74,9 +81,14 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 	// Ensure headers are captured before first write
 	// This is critical because Write() may trigger WriteHeader() internally
 	w.ensureHeadersCaptured()
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	w.ensureStreamingInitialized(w.statusCode)
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.Write(data)
+	w.responseBytesSeen += int64(n)
 
 	// THEN: Handle logging based on response type
 	if w.isStreaming && w.chunkChannel != nil {
@@ -84,22 +96,24 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
 		}
-		// For streaming responses: Send to async logging channel (non-blocking)
-		select {
-		case w.chunkChannel <- append([]byte(nil), data...): // Non-blocking send with copy
-		default: // Channel full, skip logging to avoid blocking
+		if n > 0 {
+			w.enqueueStreamingChunk(data[:n])
 		}
 		return n, err
 	}
 
-	if w.shouldBufferResponseBody() {
-		w.body.Write(data)
+	if n > 0 && w.shouldBufferResponseBody() {
+		w.appendResponseBody(data[:n])
 	}
 
 	return n, err
 }
 
 func (w *ResponseWriterWrapper) shouldBufferResponseBody() bool {
+	if w.body != nil && w.body.Len() >= maxCapturedResponseBodyBytes {
+		w.bodyTruncated = true
+		return false
+	}
 	if w.logger != nil && w.logger.IsEnabled() {
 		return true
 	}
@@ -122,9 +136,14 @@ func (w *ResponseWriterWrapper) shouldBufferResponseBody() bool {
 // bypass Write() and would be missing from request logs.
 func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 	w.ensureHeadersCaptured()
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	w.ensureStreamingInitialized(w.statusCode)
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.WriteString(data)
+	w.responseBytesSeen += int64(n)
 
 	// THEN: Capture for logging
 	if w.isStreaming && w.chunkChannel != nil {
@@ -132,17 +151,66 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
 		}
-		select {
-		case w.chunkChannel <- []byte(data):
-		default:
+		if n > 0 {
+			w.enqueueStreamingChunk([]byte(data[:n]))
 		}
 		return n, err
 	}
 
-	if w.shouldBufferResponseBody() {
-		w.body.WriteString(data)
+	if n > 0 && w.shouldBufferResponseBody() {
+		w.appendResponseString(data[:n])
 	}
 	return n, err
+}
+
+func (w *ResponseWriterWrapper) enqueueStreamingChunk(data []byte) {
+	if w.chunkChannel == nil || len(data) == 0 {
+		return
+	}
+	payload := data
+	if len(payload) > maxStreamingQueuedChunkBytes {
+		payload = payload[:maxStreamingQueuedChunkBytes]
+		w.streamTruncated = true
+	}
+	select {
+	case w.chunkChannel <- bytes.Clone(payload):
+	default:
+		w.streamTruncated = true
+	}
+}
+
+func (w *ResponseWriterWrapper) appendResponseBody(data []byte) {
+	if w.body == nil || len(data) == 0 {
+		return
+	}
+	remaining := maxCapturedResponseBodyBytes - w.body.Len()
+	if remaining <= 0 {
+		w.bodyTruncated = true
+		return
+	}
+	if len(data) > remaining {
+		_, _ = w.body.Write(data[:remaining])
+		w.bodyTruncated = true
+		return
+	}
+	_, _ = w.body.Write(data)
+}
+
+func (w *ResponseWriterWrapper) appendResponseString(data string) {
+	if w.body == nil || data == "" {
+		return
+	}
+	remaining := maxCapturedResponseBodyBytes - w.body.Len()
+	if remaining <= 0 {
+		w.bodyTruncated = true
+		return
+	}
+	if len(data) > remaining {
+		_, _ = w.body.WriteString(data[:remaining])
+		w.bodyTruncated = true
+		return
+	}
+	_, _ = w.body.WriteString(data)
 }
 
 // WriteHeader wraps the underlying ResponseWriter's WriteHeader method.
@@ -153,23 +221,27 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 
 	// Capture response headers using the new method
 	w.captureCurrentHeaders()
+	w.ensureStreamingInitialized(statusCode)
+
+	// Call original WriteHeader
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *ResponseWriterWrapper) ensureStreamingInitialized(statusCode int) {
+	if w.streamWriter != nil || w.chunkChannel != nil {
+		return
+	}
 
 	// Detect streaming based on Content-Type
 	contentType := w.ResponseWriter.Header().Get("Content-Type")
 	w.isStreaming = w.detectStreaming(contentType)
 
 	// If streaming, initialize streaming log writer
-	if w.isStreaming && w.logger.IsEnabled() {
-		streamWriter, err := w.logger.LogStreamingRequest(
-			w.requestInfo.URL,
-			w.requestInfo.Method,
-			w.requestInfo.Headers,
-			w.requestInfo.Body,
-			w.requestInfo.RequestID,
-		)
+	if w.isStreaming && w.logger != nil && w.logger.IsEnabled() {
+		streamWriter, err := w.openStreamingLogWriter()
 		if err == nil {
 			w.streamWriter = streamWriter
-			w.chunkChannel = make(chan []byte, 100) // Buffered channel for async writes
+			w.chunkChannel = make(chan []byte, 32) // Buffered channel for async writes
 			doneChan := make(chan struct{})
 			w.streamDone = doneChan
 
@@ -180,9 +252,25 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 			_ = streamWriter.WriteStatus(statusCode, w.headers)
 		}
 	}
+}
 
-	// Call original WriteHeader
-	w.ResponseWriter.WriteHeader(statusCode)
+func (w *ResponseWriterWrapper) openStreamingLogWriter() (logging.StreamingLogWriter, error) {
+	requestBytes := int64(0)
+	requestBodyTruncated := false
+	if w.requestInfo != nil {
+		requestBytes = w.requestInfo.BodyBytes
+		requestBodyTruncated = w.requestInfo.BodyTruncated
+		if requestBytes <= 0 && len(w.requestInfo.Body) > 0 {
+			requestBytes = int64(len(w.requestInfo.Body))
+		}
+		if loggerWithCaptureInfo, ok := w.logger.(interface {
+			LogStreamingRequestWithCaptureInfo(string, string, map[string][]string, []byte, bool, int64, string) (logging.StreamingLogWriter, error)
+		}); ok {
+			return loggerWithCaptureInfo.LogStreamingRequestWithCaptureInfo(w.requestInfo.URL, w.requestInfo.Method, w.requestInfo.Headers, w.requestInfo.Body, requestBodyTruncated, requestBytes, w.requestInfo.RequestID)
+		}
+		return w.logger.LogStreamingRequest(w.requestInfo.URL, w.requestInfo.Method, w.requestInfo.Headers, w.requestInfo.Body, w.requestInfo.RequestID)
+	}
+	return w.logger.LogStreamingRequest("", "", nil, nil, "")
 }
 
 // ensureHeadersCaptured is a helper function to make sure response headers are captured.
@@ -310,6 +398,11 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		if len(apiWebsocketTimeline) > 0 {
 			_ = w.streamWriter.WriteAPIWebsocketTimeline(apiWebsocketTimeline)
 		}
+		if w.streamTruncated {
+			if marker, ok := w.streamWriter.(interface{ MarkResponseTruncated() }); ok {
+				marker.MarkResponseTruncated()
+			}
+		}
 		if err := w.streamWriter.Close(); err != nil {
 			w.streamWriter = nil
 			return err
@@ -429,6 +522,41 @@ func extractBodyOverride(c *gin.Context, key string) []byte {
 func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, headers map[string][]string, body, websocketTimeline, apiRequestBody, apiResponseBody, apiWebsocketTimeline []byte, apiResponseTimestamp time.Time, apiResponseErrors []*interfaces.ErrorMessage, forceLog bool) error {
 	if w.requestInfo == nil {
 		return nil
+	}
+	requestBytes := w.requestInfo.BodyBytes
+	if requestBytes <= 0 && len(requestBody) > 0 {
+		requestBytes = int64(len(requestBody))
+	}
+	responseBytes := w.responseBytesSeen
+	if responseBytes <= 0 && len(body) > 0 {
+		responseBytes = int64(len(body))
+	}
+
+	if loggerWithCaptureInfo, ok := w.logger.(interface {
+		LogRequestWithCaptureInfo(string, string, map[string][]string, []byte, bool, int64, int, map[string][]string, []byte, bool, int64, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, bool, string, time.Time, time.Time) error
+	}); ok {
+		return loggerWithCaptureInfo.LogRequestWithCaptureInfo(
+			w.requestInfo.URL,
+			w.requestInfo.Method,
+			w.requestInfo.Headers,
+			requestBody,
+			w.requestInfo.BodyTruncated,
+			requestBytes,
+			statusCode,
+			headers,
+			body,
+			w.bodyTruncated,
+			responseBytes,
+			websocketTimeline,
+			apiRequestBody,
+			apiResponseBody,
+			apiWebsocketTimeline,
+			apiResponseErrors,
+			forceLog,
+			w.requestInfo.RequestID,
+			w.requestInfo.Timestamp,
+			apiResponseTimestamp,
+		)
 	}
 
 	if loggerWithOptions, ok := w.logger.(interface {

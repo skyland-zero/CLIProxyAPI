@@ -28,6 +28,7 @@ import (
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logdb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
@@ -63,6 +64,9 @@ type serverOptionConfig struct {
 type ServerOption func(*serverOptionConfig)
 
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
+	if logdb.Enabled() {
+		return logdb.NewRequestLogger(cfg.RequestLog)
+	}
 	configDir := filepath.Dir(configPath)
 	logsDir := logging.ResolveLogDirectory(cfg)
 	return logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
@@ -559,6 +563,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/usage/events", s.mgmt.DeleteUsageEvents)
 		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
+		mgmt.GET("/app-logs", s.mgmt.GetAppLogs)
+		mgmt.GET("/request-logs", s.mgmt.GetRequestLogs)
+		mgmt.GET("/request-logs/:id", s.mgmt.GetRequestLogRecord)
+		mgmt.GET("/request-logs/:id/content", s.mgmt.GetRequestLogContent)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
@@ -979,6 +987,10 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
 func (s *Server) UpdateClients(cfg *config.Config) {
+	if logdb.ForceEnableRequestLog(cfg) {
+		log.Info("request-log enabled automatically because PostgreSQL log storage is active")
+	}
+
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {

@@ -89,17 +89,27 @@ func GinLogrusLogger() gin.HandlerFunc {
 			logLine = logLine + " | " + errorMessage
 		}
 
-		entry := log.WithField("request_id", requestID)
-
 		switch {
 		case statusCode >= http.StatusInternalServerError:
-			entry.Error(logLine)
+			accessLogEntry(requestID, statusCode, method, path, latency, clientIP).Error(logLine)
 		case statusCode >= http.StatusBadRequest:
-			entry.Warn(logLine)
+			accessLogEntry(requestID, statusCode, method, path, latency, clientIP).Warn(logLine)
 		default:
-			entry.Info(logLine)
+			log.WithField("request_id", requestID).Info(logLine)
 		}
 	}
+}
+
+func accessLogEntry(requestID string, statusCode int, method, path string, latency time.Duration, clientIP string) *log.Entry {
+	return log.WithFields(log.Fields{
+		"request_id":  requestID,
+		"log_kind":    "access",
+		"http_status": statusCode,
+		"method":      method,
+		"path":        path,
+		"latency_ms":  latency.Milliseconds(),
+		"client_ip":   clientIP,
+	})
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

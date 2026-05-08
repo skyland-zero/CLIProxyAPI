@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cmd"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logdb"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -398,6 +399,10 @@ func main() {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
+	if usePostgresStore && !cfg.RequestLog {
+		cfg.RequestLog = true
+		log.Info("request-log enabled automatically because PGSTORE_DSN is configured")
+	}
 
 	// In cloud deploy mode, check if we have a valid configuration
 	var configFileExists bool
@@ -431,7 +436,20 @@ func main() {
 			log.Errorf("failed to initialize postgres pricing store: %v", errPricing)
 			return
 		}
+		if errLogDB := logdb.InitializePostgres(ctxUsage, logdb.Config{DSN: pgStoreDSN, Schema: pgStoreSchema}); errLogDB != nil {
+			cancelUsage()
+			log.Errorf("failed to initialize postgres log store: %v", errLogDB)
+			return
+		}
 		cancelUsage()
+		logdb.RegisterAppLogHook()
+		defer func() {
+			ctxLogDB, cancelLogDB := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelLogDB()
+			if errLogDB := logdb.ShutdownDefault(ctxLogDB); errLogDB != nil {
+				log.Errorf("failed to shutdown postgres log store: %v", errLogDB)
+			}
+		}()
 	} else {
 		usage.InitializeMemory()
 		pricing.InitializeMemory()

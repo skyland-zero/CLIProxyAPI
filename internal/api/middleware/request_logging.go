@@ -15,7 +15,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
-const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
+const (
+	maxCapturedRequestBodyBytes          int64 = 4 << 20 // 4 MiB
+	maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
+)
 
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
@@ -89,13 +92,13 @@ func isResponsesWebsocketUpgrade(req *http.Request) bool {
 }
 
 func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {
-	if loggerEnabled {
-		return true
-	}
 	if req == nil || req.Body == nil {
 		return false
 	}
 	contentType := strings.ToLower(strings.TrimSpace(req.Header.Get("Content-Type")))
+	if loggerEnabled {
+		return req.ContentLength > 0 && req.ContentLength <= maxCapturedRequestBodyBytes
+	}
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		return false
 	}
@@ -138,14 +141,27 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		body = bodyBytes
 	}
+	bodyBytes := int64(len(body))
+	bodyTruncated := false
+	if c.Request.ContentLength > 0 {
+		bodyBytes = c.Request.ContentLength
+		bodyTruncated = !captureBody || int64(len(body)) < c.Request.ContentLength
+	} else if c.Request.ContentLength < 0 {
+		bodyBytes = -1
+		bodyTruncated = true
+	} else if !captureBody && c.Request.Body != nil && c.Request.ContentLength != 0 {
+		bodyTruncated = true
+	}
 
 	return &RequestInfo{
-		URL:       url,
-		Method:    method,
-		Headers:   headers,
-		Body:      body,
-		RequestID: logging.GetGinRequestID(c),
-		Timestamp: time.Now(),
+		URL:           url,
+		Method:        method,
+		Headers:       headers,
+		Body:          body,
+		BodyBytes:     bodyBytes,
+		BodyTruncated: bodyTruncated,
+		RequestID:     logging.GetGinRequestID(c),
+		Timestamp:     time.Now(),
 	}, nil
 }
 
